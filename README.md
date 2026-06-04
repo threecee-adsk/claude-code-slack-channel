@@ -22,6 +22,74 @@ Claude Code session
 
 Socket Mode means **no public URL needed** — works behind firewalls, NAT, anywhere.
 
+## Multi-Session Routing (fork addition)
+
+This fork adds **multiple Claude Code sessions reachable from different Slack
+channels and threads**. A standalone **router** owns the single Socket Mode
+connection and routes each inbound event to the bound session; each Claude
+session runs a thin MCP client (`slack-session.ts`) that registers with the
+router. Inspired by
+[`agostinopisani19/claude-code-multisession-channels`](https://github.com/agostinopisani19/claude-code-multisession-channels),
+but routing is **by destination** (a binding table) rather than a single
+`/switch`-selected active session.
+
+```
+Slack ──▶ slack-router (owns Socket Mode, :8801) ──HTTP──▶ slack-session ──stdio──▶ Claude (per project)
+                          binding table: thread → channel → default
+```
+
+Quick start (single-session mode is unchanged and remains the default):
+
+```bash
+# 1. Start the router once (it owns the socket; uses the same ~/.claude/channels/slack/.env):
+npm run router          # or: npx tsx slack-router.ts
+
+# 2. Launch each Claude session in multi-session mode, naming it and claiming channels:
+SLACK_MULTISESSION=1 SESSION_NAME=forma  SLACK_BIND=C0123FORMA  claude --channels plugin:slack-channel@slack-channel-upstream
+SLACK_MULTISESSION=1 SESSION_NAME=2brain SLACK_BIND=C0456BRAIN  claude --channels plugin:slack-channel@slack-channel-upstream
+```
+
+Then in Slack: `!sessions` lists them, `!bind <name>` binds the current channel
+(or thread), `!route` shows where a channel/thread resolves, `!default <name>`
+sets the fallback. Resolution order is **thread → channel → default**. Full
+design and HTTP protocol: [`docs/multi-session-routing.md`](docs/multi-session-routing.md).
+
+> Status: Phase 1 (routing, replies, commands, permission relay via `y/n <code>`).
+> File attachments, streaming replies, and `download_attachment` are Phase 2.
+
+### Keeping it running (supervisor)
+
+`slack-supervisor.ts` is a config-driven daemon that keeps the router and every
+session alive — respawning anything that dies, with backoff, and **resuming**
+each Claude session by a stable session ID so its conversation survives a crash.
+Session liveness is ground-truthed against the router's `/health` (tmux up *and*
+registered in the router).
+
+One-time setup:
+
+```bash
+brew install tmux                                   # sessions run in tmux (persistent pty)
+# register the per-session channel as a user MCP server (loaded via server:slack-session):
+claude mcp add -s user slack-session -- "$PWD/node_modules/.bin/tsx" "$PWD/slack-session.ts"
+cp supervisor.example.json ~/.claude/slack-router/supervisor.json   # then edit: cwd, bind, name per session
+```
+
+Run it:
+
+```bash
+npm run supervisor            # = npx tsx slack-supervisor.ts  (supervise forever)
+npm run supervisor -- status  # one health snapshot
+npm run supervisor -- down    # stop router + kill session tmux windows
+```
+
+Each session is launched as
+`claude --dangerously-load-development-channels server:slack-session --resume <id>`
+inside a tmux window named `slack-<name>`, with `SESSION_NAME`/`SLACK_BIND` in its
+env. The exact launch line is the configurable `launchTemplate` — the channels
+flags are a Research-Preview feature hidden from `claude --help`, so if your build
+differs, edit the template (no code change). `--dangerously-load-development-channels`
+must be passed every launch; there is no user-level allowlist to persist it.
+
 ## Quick Start
 
 **For AI-assisted setup**: run `/slack-channel:install` and your AI assistant will walk you through every step below. The install skill also supports `doctor` (health check), `verify` (round-trip test), `repair` (auto-fix), `manifest` (one-click Slack-app import), `reset`, `tour`, and `uninstall` modes — see [`skills/install/SKILL.md`](skills/install/SKILL.md).
