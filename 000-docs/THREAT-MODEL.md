@@ -441,6 +441,49 @@ surfaces — exactly where admin commands live.
 
 ---
 
+### T12. Operator session-management command → process spawn / channel creation (HA → SO/infra) — multi-session
+
+> An allowlisted operator issues a Slack session-management verb (`!kill`,
+> `!restart`, `!new-channel-bot`) that spawns or kills a `claude` process or
+> creates a Slack channel. The operator may be coerced (T11/EchoLeak class —
+> a poisoned snippet says "run `!new-channel-bot evil /etc`") or their own
+> prompt-injected session may emit the verb.
+
+This is the **multi-session** analogue of T11, on a higher-impact surface:
+where T11's `!clear`/`!restart` act on one already-running session, T12's verbs
+spawn new OS processes (via the supervisor's tmux launcher) and create Slack
+channels (`conversations.create`). These verbs live in `slack-router.ts` and
+the supervisor control API — not in `server.ts`/`admin.ts` — and, by an
+explicit product decision, reuse the regular `access.allowFrom` gate **without**
+the nonce/HITL handshake that backs T11.
+
+- **Realistic forms**: a coerced operator pastes `!new-channel-bot x /some/path`;
+  a prompt-injected session suggests `!kill <prod-session>`; a poisoned name
+  attempts path traversal (`!new-channel-bot x /srv/bots/../../etc`).
+- **Mitigation layering**:
+  1. **Allowlist gate.** Same-workspace identity in `access.allowFrom`; not
+     forgeable from outside the workspace.
+  2. **Pure input validators.** `isValidSessionName` (charset/length, rejects
+     `:`, whitespace, shell metacharacters, path separators),
+     `sanitizeSlackChannelName` (Slack-legal names only), and `validateBotCwd`
+     (resolve + confine to `defaultCwd`/`allowedCwdRoots`; `..` cannot escape).
+     The supervisor re-validates server-side via `/sessions/precheck` and
+     `/sessions/add` — the router's checks are not load-bearing alone.
+  3. **Argv-mode spawn.** Sessions launch through tmux `execFileSync` with an
+     argv array (the T11 floor) — no shell string interpolation of the name/cwd.
+  4. **Loopback-only control API.** The supervisor's `/sessions/*` endpoints
+     bind `127.0.0.1`; the router is the only caller.
+  5. **Reachability is not auto-granted.** `!new-channel-bot` never writes
+     `access.json` (invariant: no access grants from chat). The created channel
+     stays gate-dropped until a human runs `/slack-channel:access channel …`.
+- **Residual risk (accepted).** With no nonce/HITL, a coerced/allowlisted
+  operator can still spawn or kill sessions and create channels (resource
+  exhaustion overlaps T10). This is a deliberate friction tradeoff; revisit if
+  abuse surfaces. The `cwd` confinement and argv-mode spawn bound the blast
+  radius to processes under `allowedCwdRoots`.
+
+---
+
 ## Invariants later epics must preserve
 
 Every implementing epic in `ARCHITECTURE.md` inherits these. CI and code

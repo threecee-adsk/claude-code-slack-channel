@@ -27,6 +27,7 @@ import {
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildNewChannelBotReply,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   type ChannelPolicy,
@@ -38,21 +39,27 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   findSecretDeclaration,
+  formatChannelLink,
   type GateOptions,
   gate,
   generateCode,
   generateCorrelationId,
   isDuplicateEvent,
   isSlackFileUrl,
+  isValidSessionName,
   loadSession,
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  mergeStatus,
   migrateFlatSessions,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
+  parseRouterAdminCommand,
   parseSendableRoots,
   pruneExpired,
+  type RouterAdminCommand,
+  type RouterSessionView,
   redactSecretValues,
   resolveJournalPath,
   SECRET_DECLARATIONS,
@@ -60,13 +67,16 @@ import {
   type SecretSink,
   type Session,
   type SessionKey,
+  type SupervisorSessionView,
   sanitizeDisplayName,
   sanitizeFilename,
+  sanitizeSlackChannelName,
   saveSession,
   secretNameFromPlaceholder,
   secretPlaceholder,
   sessionPath,
   shouldPostAuditReceipt,
+  validateBotCwd,
   validateSendableRoots,
 } from './lib.ts'
 import {
@@ -14763,3 +14773,278 @@ describe('ccsc-l1f — runAuditKeyCli (dispatch + defaults)', () => {
     expect(errs.some((m) => m.toLowerCase().includes('usage'))).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Multi-session operator commands — pure helpers (router !status / !kill /
+// !restart / !new-channel-bot). The router/supervisor wiring is out of the
+// coverage floor; these pure helpers carry the tested surface.
+// ---------------------------------------------------------------------------
+
+describe('isValidSessionName', () => {
+  test('accepts lowercase alnum with - and _', () => {
+    expect(isValidSessionName('forma')).toBe(true)
+    expect(isValidSessionName('second-brain_2')).toBe(true)
+    expect(isValidSessionName('a')).toBe(true)
+  })
+
+  test('rejects empty', () => {
+    expect(isValidSessionName('')).toBe(false)
+  })
+
+  test('rejects names over 32 chars', () => {
+    expect(isValidSessionName('a'.repeat(32))).toBe(true)
+    expect(isValidSessionName('a'.repeat(33))).toBe(false)
+  })
+
+  test('rejects uppercase', () => {
+    expect(isValidSessionName('Forma')).toBe(false)
+  })
+
+  test('rejects whitespace', () => {
+    expect(isValidSessionName('two words')).toBe(false)
+  })
+
+  test('rejects a colon (would corrupt thread-binding keys)', () => {
+    expect(isValidSessionName('a:b')).toBe(false)
+  })
+
+  test('rejects a leading hyphen (could look like a tmux flag)', () => {
+    expect(isValidSessionName('-x')).toBe(false)
+  })
+
+  test('rejects shell metacharacters and path separators', () => {
+    expect(isValidSessionName('a/b')).toBe(false)
+    expect(isValidSessionName('a;b')).toBe(false)
+    expect(isValidSessionName('a$b')).toBe(false)
+  })
+
+  test('rejects non-string', () => {
+    expect(isValidSessionName(123 as unknown as string)).toBe(false)
+  })
+})
+
+describe('sanitizeSlackChannelName', () => {
+  test('lowercases', () => {
+    expect(sanitizeSlackChannelName('MyChannel')).toBe('mychannel')
+  })
+
+  test('replaces spaces and invalid chars with single hyphens', () => {
+    expect(sanitizeSlackChannelName('my cool channel!')).toBe('my-cool-channel')
+  })
+
+  test('collapses repeated hyphens', () => {
+    expect(sanitizeSlackChannelName('a---b')).toBe('a-b')
+  })
+
+  test('trims leading and trailing hyphens', () => {
+    expect(sanitizeSlackChannelName('  hello  ')).toBe('hello')
+    expect(sanitizeSlackChannelName('--edge--')).toBe('edge')
+  })
+
+  test('truncates to 80 chars with no trailing hyphen', () => {
+    const out = sanitizeSlackChannelName('x'.repeat(200))
+    expect(out.length).toBe(80)
+    expect(out.endsWith('-')).toBe(false)
+  })
+
+  test('returns empty when nothing legal survives', () => {
+    expect(sanitizeSlackChannelName('!!!')).toBe('')
+    expect(sanitizeSlackChannelName('')).toBe('')
+  })
+
+  test('returns empty for non-string', () => {
+    expect(sanitizeSlackChannelName(null as unknown as string)).toBe('')
+  })
+
+  test('keeps underscores', () => {
+    expect(sanitizeSlackChannelName('a_b')).toBe('a_b')
+  })
+})
+
+describe('validateBotCwd', () => {
+  const roots = ['/Users/me/code', '/srv/bots']
+
+  test('falls back to defaultCwd when arg is empty', () => {
+    const r = validateBotCwd(undefined, '/Users/me/code/second-brain', roots)
+    expect(r).toEqual({ ok: true, cwd: '/Users/me/code/second-brain' })
+  })
+
+  test('accepts an explicit path inside an allowed root', () => {
+    const r = validateBotCwd('/srv/bots/foo', '/Users/me/code/second-brain', roots)
+    expect(r).toEqual({ ok: true, cwd: '/srv/bots/foo' })
+  })
+
+  test('accepts a subdirectory of defaultCwd even when not in allowedRoots', () => {
+    const r = validateBotCwd('/Users/me/code/second-brain/proj', '/Users/me/code/second-brain', [])
+    expect(r).toEqual({ ok: true, cwd: '/Users/me/code/second-brain/proj' })
+  })
+
+  test('rejects path traversal that escapes the allowed roots', () => {
+    const r = validateBotCwd('/srv/bots/../../etc', '/Users/me/code/second-brain', roots)
+    expect(r.ok).toBe(false)
+  })
+
+  test('rejects an absolute path outside every root', () => {
+    const r = validateBotCwd('/etc/passwd', '/Users/me/code/second-brain', roots)
+    expect(r.ok).toBe(false)
+  })
+
+  test('rejects a relative path', () => {
+    const r = validateBotCwd('foo/bar', '/Users/me/code/second-brain', roots)
+    expect(r.ok).toBe(false)
+    if (r.ok) throw new Error('expected rejection')
+    expect(r.error).toContain('absolute')
+  })
+
+  test('rejects when neither arg nor defaultCwd is set', () => {
+    const r = validateBotCwd(undefined, '', roots)
+    expect(r.ok).toBe(false)
+    if (r.ok) throw new Error('expected rejection')
+    expect(r.error).toContain('defaultCwd')
+  })
+
+  test('a sibling-prefix path is not treated as inside (boundary check)', () => {
+    // /srv/bots-evil must NOT match the /srv/bots root.
+    const r = validateBotCwd('/srv/bots-evil', '/Users/me/code/second-brain', roots)
+    expect(r.ok).toBe(false)
+  })
+})
+
+describe('parseRouterAdminCommand', () => {
+  test('status', () => {
+    expect(parseRouterAdminCommand('status', '')).toEqual({ kind: 'status' })
+  })
+
+  test('kill with a name', () => {
+    expect(parseRouterAdminCommand('kill', 'forma')).toEqual({ kind: 'kill', name: 'forma' })
+  })
+
+  test('kill takes only the first token', () => {
+    expect(parseRouterAdminCommand('kill', 'forma extra junk')).toEqual({
+      kind: 'kill',
+      name: 'forma',
+    })
+  })
+
+  test('kill with empty arg yields an empty name (caller renders usage)', () => {
+    expect(parseRouterAdminCommand('kill', '')).toEqual({ kind: 'kill', name: '' })
+  })
+
+  test('restart and reconnect are synonyms', () => {
+    const a = parseRouterAdminCommand('restart', 'forma')
+    const b = parseRouterAdminCommand('reconnect', 'forma')
+    expect(a).toEqual({ kind: 'restart', name: 'forma' })
+    expect(b).toEqual({ kind: 'restart', name: 'forma' })
+  })
+
+  test('new-channel-bot with name only', () => {
+    expect(parseRouterAdminCommand('new-channel-bot', 'my-bot')).toEqual({
+      kind: 'newChannelBot',
+      rawName: 'my-bot',
+      cwdArg: undefined,
+    })
+  })
+
+  test('new-channel-bot with name and cwd', () => {
+    expect(parseRouterAdminCommand('new-channel-bot', 'my-bot /srv/bots/x')).toEqual({
+      kind: 'newChannelBot',
+      rawName: 'my-bot',
+      cwdArg: '/srv/bots/x',
+    })
+  })
+
+  test('newchannelbot (no hyphens) is accepted as a synonym', () => {
+    const r = parseRouterAdminCommand('newchannelbot', 'x')
+    expect(r?.kind).toBe('newChannelBot')
+  })
+
+  test('new-channel-bot with empty arg yields empty rawName', () => {
+    expect(parseRouterAdminCommand('new-channel-bot', '')).toEqual({
+      kind: 'newChannelBot',
+      rawName: '',
+      cwdArg: undefined,
+    })
+  })
+
+  test('unknown verb returns null (falls through to normal message)', () => {
+    expect(parseRouterAdminCommand('bind', 'forma')).toBeNull()
+    expect(parseRouterAdminCommand('frobulate', '')).toBeNull()
+  })
+})
+
+describe('mergeStatus', () => {
+  const router: RouterSessionView[] = [
+    { name: 'forma', pid: 111, live: true, claims: ['C1'], isDefault: true },
+  ]
+  const supervisor: SupervisorSessionView[] = [
+    { name: 'forma', tmux: true, bind: ['C1'], cwd: '/Users/me/code/forma', uuid: 'u1' },
+  ]
+
+  test('empty inputs report nothing known', () => {
+    expect(mergeStatus([], [])).toContain('No sessions known')
+  })
+
+  test('a registered + tmux-up session shows live dot, default, pid, bind, cwd', () => {
+    const out = mergeStatus(router, supervisor)
+    expect(out).toContain('● forma')
+    expect(out).toContain('(default)')
+    expect(out).toContain('registered')
+    expect(out).toContain('tmux up')
+    expect(out).toContain('pid 111')
+    expect(out).toContain('bind: C1')
+    expect(out).toContain('/Users/me/code/forma')
+  })
+
+  test('a configured session with no registration shows unregistered + open dot', () => {
+    const out = mergeStatus([], supervisor)
+    expect(out).toContain('○ forma')
+    expect(out).toContain('unregistered')
+  })
+
+  test('an orphan tmux registration with no supervisor config is surfaced', () => {
+    const out = mergeStatus(router, [])
+    expect(out).toContain('not in supervisor config')
+  })
+
+  test('tmux-down is reported distinctly from tmux-up', () => {
+    const out = mergeStatus(router, [
+      { name: 'forma', tmux: false, bind: ['C1'], cwd: '/x', uuid: 'u1' },
+    ])
+    expect(out).toContain('tmux down')
+  })
+})
+
+describe('formatChannelLink + buildNewChannelBotReply', () => {
+  test('formatChannelLink renders a Slack channel mention', () => {
+    expect(formatChannelLink('C0ABC')).toBe('<#C0ABC>')
+  })
+
+  test('reply names the channel, session, cwd, and the terminal opt-in command', () => {
+    const out = buildNewChannelBotReply({
+      channelId: 'C0NEW',
+      sessionName: 'my-bot',
+      cwd: '/srv/bots/my-bot',
+      operatorUserId: 'U0OP',
+    })
+    expect(out).toContain('<#C0NEW>')
+    expect(out).toContain('my-bot')
+    expect(out).toContain('/srv/bots/my-bot')
+    expect(out).toContain('/slack-channel:access channel C0NEW --allow U0OP')
+    expect(out).toContain('silent')
+  })
+
+  test('reply does not instruct any automatic access grant', () => {
+    const out = buildNewChannelBotReply({
+      channelId: 'C0NEW',
+      sessionName: 'my-bot',
+      cwd: '/srv/bots/my-bot',
+      operatorUserId: 'U0OP',
+    })
+    // The opt-in is a human terminal action — the reply must surface that.
+    expect(out).toContain('from your terminal')
+  })
+})
+
+// A type-only reference to keep RouterAdminCommand exercised by the suite.
+const _routerCmdTypeCheck: RouterAdminCommand = { kind: 'status' }
+void _routerCmdTypeCheck

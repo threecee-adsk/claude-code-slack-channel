@@ -49,6 +49,13 @@ import {
   isSlackFileUrl,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
+  parseRouterAdminCommand,
+  isValidSessionName,
+  sanitizeSlackChannelName,
+  mergeStatus,
+  buildNewChannelBotReply,
+  type RouterSessionView,
+  type SupervisorSessionView,
   type Access,
   type GateResult,
 } from './lib.ts'
@@ -67,6 +74,11 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // File-exfil allowlist: roots beyond INBOX_DIR the reply tool may attach from
 // (colon-separated absolute paths via SLACK_SENDABLE_ROOTS). Default: inbox only.
 const SENDABLE_ROOTS = parseSendableRoots(process.env.SLACK_SENDABLE_ROOTS)
+// Operator session-management (router → supervisor control API). Defaults match
+// the supervisor's defaults; the supervisor overrides both via the env it sets
+// when it spawns the router, so supervisor.json stays the single config source.
+const SUPERVISOR_PORT = Number(process.env.SUPERVISOR_PORT ?? 8802)
+const NEW_CHANNEL_PRIVATE = (process.env.NEW_CHANNEL_VISIBILITY ?? 'private').toLowerCase() !== 'public'
 
 mkdirSync(ROUTER_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
@@ -273,6 +285,37 @@ async function postToSession(s: SessionEntry, path: string, body: unknown): Prom
   }
 }
 
+type SupervisorResult =
+  | { ok: true; data: Record<string, unknown> }
+  | { ok: false; error: string }
+
+/** Call the supervisor's loopback control API. Short timeout so a stopped
+ *  supervisor degrades to a clear message rather than hanging the command. */
+async function callSupervisor(
+  path: string,
+  body?: unknown,
+  method: 'GET' | 'POST' = 'POST',
+): Promise<SupervisorResult> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${SUPERVISOR_PORT}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
+      signal: AbortSignal.timeout(2000),
+    })
+    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok || data.ok === false) {
+      return { ok: false, error: String(data.error ?? `supervisor returned ${res.status}`) }
+    }
+    return { ok: true, data }
+  } catch {
+    return {
+      ok: false,
+      error: `supervisor unreachable on :${SUPERVISOR_PORT} — is \`slack-supervisor up\` running?`,
+    }
+  }
+}
+
 // ── Outbound Slack helpers (used by HTTP handlers) ───────────────────────────
 async function sendReply(args: {
   chat_id: string
@@ -357,7 +400,9 @@ const pendingPermissions = new Map<
 >()
 
 // ── Commands (intercepted before gate/forward) ───────────────────────────────
-const COMMAND_RE = /^!(\w+)\s*(.*)$/
+// `[\w-]` (not `\w`) so hyphenated verbs like `!new-channel-bot` parse as one
+// token; all pre-existing verbs are `\w+`, so this is backward-compatible.
+const COMMAND_RE = /^!([\w-]+)\s*(.*)$/
 
 function sessionList(): string {
   const names = Object.keys(state.sessions)
@@ -386,17 +431,133 @@ function bindingsForChannel(channel: string): string {
 
 /** Handle a `!command`. Returns true if the message was a command (and was
  *  handled — no further routing). Only allowlisted users reach here. */
+type Say = (t: string) => Promise<string>
+
+/** `!status` — enriched session view: the router's registration/liveness joined
+ *  with the supervisor's tmux/cwd/bind view. Degrades to the basic list when
+ *  the supervisor is offline. */
+async function cmdStatus(say: Say): Promise<void> {
+  const routerView: RouterSessionView[] = Object.values(state.sessions).map(s => ({
+    name: s.name,
+    pid: s.pid,
+    live: isAlive(s),
+    claims: s.claims,
+    isDefault: state.bindings.default === s.name,
+  }))
+  const result = await callSupervisor('/status', undefined, 'GET')
+  if (!result.ok) {
+    await say(`${sessionList()}\n\n(supervisor offline — ${result.error})`)
+    return
+  }
+  const supSessions = (result.data.sessions as SupervisorSessionView[] | undefined) ?? []
+  await say(mergeStatus(routerView, supSessions))
+}
+
+/** `!kill <name>` — stop a session and remove it from the supervisor config so
+ *  it does not respawn. */
+async function cmdKill(name: string, say: Say): Promise<void> {
+  if (!name) return void (await say('Usage: !kill <session-name>'))
+  if (!isValidSessionName(name)) return void (await say(`Invalid session name: ${name}`))
+  const r = await callSupervisor('/sessions/kill', { name })
+  await say(r.ok ? `Killed session \`${name}\` — it will not respawn.` : `Couldn't kill \`${name}\`: ${r.error}`)
+}
+
+/** `!restart <name>` / `!reconnect <name>` — kill the Claude session and let the
+ *  supervisor bring it straight back (resuming its conversation). */
+async function cmdRestart(name: string, say: Say): Promise<void> {
+  if (!name) return void (await say('Usage: !restart <session-name>'))
+  if (!isValidSessionName(name)) return void (await say(`Invalid session name: ${name}`))
+  const r = await callSupervisor('/sessions/restart', { name })
+  await say(r.ok ? `Restarting \`${name}\`… it will re-register shortly.` : `Couldn't restart \`${name}\`: ${r.error}`)
+}
+
+/** `!new-channel-bot <name> [cwd]` — create a Slack channel, invite the
+ *  operator, and wire+spawn a new Claude session bound to it. Prechecks
+ *  name/cwd with the supervisor first so a bad request doesn't orphan a
+ *  channel. */
+async function cmdNewChannelBot(
+  rawName: string,
+  cwdArg: string | undefined,
+  userId: string,
+  say: Say,
+): Promise<void> {
+  const name = sanitizeSlackChannelName(rawName)
+  if (!name || !isValidSessionName(name)) {
+    return void (await say('Usage: !new-channel-bot <name> [cwd] — name must be lowercase letters, digits, `-`, `_`.'))
+  }
+  // Validate against the supervisor's name/cwd rules BEFORE creating anything.
+  const pre = await callSupervisor('/sessions/precheck', { name, cwd: cwdArg })
+  if (!pre.ok) return void (await say(`Can't create bot \`${name}\`: ${pre.error}`))
+
+  let channelId = ''
+  try {
+    const created = await web.conversations.create({ name, is_private: NEW_CHANNEL_PRIVATE })
+    channelId = (created.channel as { id?: string } | undefined)?.id ?? ''
+    if (!channelId) return void (await say('Created the channel but Slack returned no channel id.'))
+  } catch (e) {
+    const err = (e as { data?: { error?: string } })?.data?.error ?? String(e)
+    if (err === 'missing_scope') {
+      await say(
+        'I lack the `channels:manage` / `groups:write` scope to create channels. Re-import the app manifest (it now includes them) and reinstall, then retry.',
+      )
+    } else if (err === 'name_taken') {
+      await say(`A channel named \`${name}\` already exists — pick a different name.`)
+    } else {
+      await say(`Couldn't create the channel: ${err}`)
+    }
+    return
+  }
+
+  // Best-effort: pull the issuing operator into the new channel.
+  try {
+    await web.conversations.invite({ channel: channelId, users: userId })
+  } catch {
+    /* already a member / cannot invite self — non-fatal */
+  }
+
+  const add = await callSupervisor('/sessions/add', { name, cwd: cwdArg, bind: [channelId], resume: true })
+  if (!add.ok) {
+    await say(
+      `Created <#${channelId}> but couldn't wire the bot: ${add.error}\n` +
+        'The channel exists; fix the issue and retry, or archive the empty channel.',
+    )
+    return
+  }
+  const cwd = String(add.data.cwd ?? cwdArg ?? '')
+  await say(buildNewChannelBotReply({ channelId, sessionName: name, cwd, operatorUserId: userId }))
+}
+
 async function handleCommand(
   text: string,
   channel: string,
   threadTs: string | undefined,
+  userId: string,
 ): Promise<boolean> {
   const m = COMMAND_RE.exec(text.trim())
   if (!m) return false
   const cmd = m[1].toLowerCase()
   const arg = m[2].trim()
   const replyInThread = threadTs
-  const say = (t: string) => sendReply({ chat_id: channel, thread_ts: replyInThread, text: t })
+  const say: Say = (t: string) => sendReply({ chat_id: channel, thread_ts: replyInThread, text: t })
+
+  // Session-management verbs (parsed via the shared pure parser).
+  const adminCmd = parseRouterAdminCommand(cmd, arg)
+  if (adminCmd) {
+    switch (adminCmd.kind) {
+      case 'status':
+        await cmdStatus(say)
+        return true
+      case 'kill':
+        await cmdKill(adminCmd.name, say)
+        return true
+      case 'restart':
+        await cmdRestart(adminCmd.name, say)
+        return true
+      case 'newChannelBot':
+        await cmdNewChannelBot(adminCmd.rawName, adminCmd.cwdArg, userId, say)
+        return true
+    }
+  }
 
   switch (cmd) {
     case 'sessions':
@@ -464,10 +625,14 @@ async function handleCommand(
       await say(
         'Multi-session router commands:\n' +
           '!sessions — list connected sessions\n' +
+          '!status — detailed status (registration + tmux + cwd + bind)\n' +
           '!bind <name> — bind this channel (or thread) to a session\n' +
           '!unbind — remove this channel/thread binding\n' +
           '!route — show where this channel/thread routes\n' +
-          '!default <name> — set the fallback session',
+          '!default <name> — set the fallback session\n' +
+          '!kill <name> — stop a session (no respawn)\n' +
+          '!restart <name> / !reconnect <name> — restart a session\n' +
+          '!new-channel-bot <name> [cwd] — create a channel + spawn a bot there',
       )
       return true
     default:
@@ -510,7 +675,7 @@ async function handleMessage(event: unknown): Promise<void> {
 
   // Command intercept (allowlisted users only).
   if (userId && access.allowFrom.includes(userId) && text.startsWith('!')) {
-    if (await handleCommand(text, channelId, threadTs)) return
+    if (await handleCommand(text, channelId, threadTs, userId)) return
   }
 
   // Permission reply intercept: "y <code>" / "n <code>".

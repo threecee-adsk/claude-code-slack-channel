@@ -173,6 +173,78 @@ Verified: router spawn/health/teardown work end to end. Session (tmux) path is s
 - Sessions register the channel as a **user MCP server** (`claude mcp add -s user slack-session -- <tsx> slack-session.ts`) and load it via `server:slack-session` — no plugin install needed on the session side. (The `plugin:` + `slack-entry.ts` path remains for the plugin-install UX.)
 - `--bg` does **not** exist; background-agent is a separate subcommand. Persistent sessions = tmux.
 
+## Operator session-management commands
+
+Allowlisted operators (`access.allowFrom`, the same gate as `!bind`) can manage
+sessions from Slack. These are **multi-session only** — `server.ts`
+(single-session) has no supervisor/registry, so they don't exist there. Note
+`!restart <name>` here restarts a *session process* and is unrelated to
+`admin.ts`'s single-session `!restart` (which restarts the one Claude TUI via
+tmux send-keys).
+
+- `!status` — registration/liveness (router) joined with tmux/cwd/bind
+  (supervisor). Degrades to the basic `!sessions` list when the supervisor is
+  offline.
+- `!kill <name>` — stop a session and remove it from the supervisor config so
+  it does **not** respawn (removing the config entry is the respawn-prevention
+  mechanism; the resume UUID is kept for an accidental re-add).
+- `!restart <name>` / `!reconnect <name>` — kill the tmux window and let the
+  supervisor bring it straight back, resuming the conversation (`--resume`).
+- `!new-channel-bot <name> [cwd]` — create a Slack channel, invite the issuing
+  operator, and wire+spawn a new session bound to it. `cwd` defaults to the
+  supervisor's `defaultCwd` (overridable by an explicit path; confined to
+  `allowedCwdRoots`). Channel visibility = supervisor `newChannelVisibility`
+  (default `private`).
+
+**Authorization tradeoff.** These verbs reuse `access.allowFrom` with no extra
+admin tier or nonce/HITL confirmation — by design, for low friction. Spawning a
+process and creating a channel are privileged actions, so a coerced/allowlisted
+operator (or a prompt-injected operator message) can spawn/kill sessions and
+create channels. See THREAT-MODEL **T12**. Mitigations: the pure validators
+(`isValidSessionName`, `sanitizeSlackChannelName`, `validateBotCwd`), argv-mode
+tmux spawning (no shell injection), and the loopback-only control API. Revisit
+if abuse surfaces.
+
+## Supervisor control API (loopback only)
+
+The router receives the Slack verbs but the supervisor owns process lifecycle,
+so the supervisor exposes a `127.0.0.1`-only HTTP control API (`supervisorPort`,
+default **8802**). The supervisor passes `SUPERVISOR_PORT` + `NEW_CHANNEL_VISIBILITY`
+to the router via env when it spawns it, so `supervisor.json` stays the single
+config source. Router → Supervisor:
+
+- `GET  /status` → `{ ok, routerPid, routerAlive, sessions: [{ name, tmux, bind, cwd, uuid }] }`
+- `POST /sessions/precheck` `{ name, cwd? }` → validates name + cwd with no side
+  effects (the router calls this **before** `conversations.create` so a bad
+  request can't orphan an empty channel).
+- `POST /sessions/add` `{ name, cwd?, bind: [channelId], resume? }` — validate,
+  append to `cfg.sessions` in place (the running tick closure shares the array),
+  persist via `saveConfig`, then `ensureSession` to spawn immediately.
+- `POST /sessions/kill` `{ name }` — remove from `cfg.sessions`, `tmuxKill`, reap
+  orphans.
+- `POST /sessions/restart` `{ name }` — `tmuxKill` + reset the respawn floor +
+  `ensureSession`.
+
+A small `withLock` promise-chain serialises every mutating endpoint against the
+`tick()` loop so a mutation can't land mid-iteration over `cfg.sessions`.
+`saveConfig` rewrites `supervisor.json` atomically — once these verbs are used
+the file becomes partly machine-managed (comments/formatting are lost,
+`defaultConfig()` defaults merged in).
+
+## New-channel-bot: binding ≠ reachability
+
+A freshly created channel is **not** in `access.channels`, and the inbound gate
+(`lib.ts` `handleChannelEvent`) drops every message from a channel with no
+policy entry. So binding the new session in the router is **not** enough — the
+channel is silent until a human opts it in. The router deliberately does **not**
+write `access.json` from a Slack message (that would breach the "no access
+grants from chat" invariant the whole system rests on); instead the success
+reply hands the operator the exact terminal command
+(`/slack-channel:access channel <id> --allow <userId>`). Channel creation needs
+the bot token to carry `channels:manage` (public) / `groups:write` (private);
+absent those, the command replies with a `missing_scope` hint and creates
+nothing.
+
 ## Open questions
 
 - Conflict policy when two sessions both declare `SLACK_BIND` for the same

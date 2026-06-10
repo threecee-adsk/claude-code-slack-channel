@@ -1864,6 +1864,190 @@ export function escMrkdwn(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-session operator commands (router `!status` / `!kill` / `!restart` /
+// `!new-channel-bot`). Pure parsing, validation, and rendering helpers so the
+// router/supervisor wiring stays thin and these stay inside the coverage floor.
+// These run on operator-typed Slack text — treat every input as untrusted.
+// ---------------------------------------------------------------------------
+
+/** A session name is used both as a tmux target (`slack-<name>`) and as a
+ *  routing key. Constrain it hard: lowercase alnum start, then alnum / `-` /
+ *  `_`, ≤32 chars. This rejects whitespace, `:` (which would corrupt the
+ *  `${channel}:${threadTs}` thread-binding keys), shell metacharacters, and
+ *  path separators — so a name from a chat message can never smuggle a tmux
+ *  flag or a second binding key. Pure. */
+export function isValidSessionName(name: unknown): name is string {
+  return (
+    typeof name === 'string' &&
+    name.length > 0 &&
+    name.length <= 32 &&
+    /^[a-z0-9][a-z0-9_-]*$/.test(name)
+  )
+}
+
+/** Coerce an operator-supplied string into a Slack-legal channel name:
+ *  lowercase, only `[a-z0-9_-]`, no repeated or edge hyphens, ≤80 chars.
+ *  Returns `''` when nothing legal survives (caller treats empty as an
+ *  error — never creates a channel from it). Pure. */
+export function sanitizeSlackChannelName(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 80)
+    .replace(/^-+|-+$/g, '')
+}
+
+export type BotCwdResult = { ok: true; cwd: string } | { ok: false; error: string }
+
+/** Resolve + confine the working directory a new channel-bot session will
+ *  `cd` into and spawn `claude` from. An empty/absent `arg` falls back to the
+ *  configured `defaultCwd`. The result must be absolute and resolve to
+ *  `defaultCwd` itself, a subdirectory of it, or inside one of `allowedRoots`
+ *  — `resolve()` collapses any `..` first, so traversal cannot escape the
+ *  allow-set. Deny-by-default: a path outside every root is rejected. Mirrors
+ *  the allowlisted-roots posture of `assertSendable`. Pure. */
+export function validateBotCwd(
+  arg: string | undefined,
+  defaultCwd: string,
+  allowedRoots: readonly string[],
+): BotCwdResult {
+  const base = (arg ?? '').trim() || (defaultCwd ?? '').trim()
+  if (!base) {
+    return {
+      ok: false,
+      error: 'no working directory given and no defaultCwd is configured on the supervisor',
+    }
+  }
+  if (!base.startsWith('/')) {
+    return { ok: false, error: `working directory must be an absolute path: ${base}` }
+  }
+  const resolved = resolve(base)
+  const roots = [defaultCwd ?? '', ...allowedRoots]
+    .map((r) => (r ?? '').trim())
+    .filter((r) => r.startsWith('/'))
+    .map((r) => resolve(r))
+  const inside = roots.some((r) => resolved === r || resolved.startsWith(r + sep))
+  if (!inside) {
+    return {
+      ok: false,
+      error: `working directory is outside the supervisor's allowed roots: ${resolved}`,
+    }
+  }
+  return { ok: true, cwd: resolved }
+}
+
+export type RouterAdminCommand =
+  | { kind: 'status' }
+  | { kind: 'kill'; name: string }
+  | { kind: 'restart'; name: string }
+  | { kind: 'newChannelBot'; rawName: string; cwdArg?: string }
+
+/** Parse a router operator verb. `cmd` is already lowercased and `arg` already
+ *  trimmed by the router's `COMMAND_RE`. Returns a typed command for a known
+ *  verb (with possibly-empty `name`/`rawName` — the caller renders the usage
+ *  error), or `null` for an unknown verb so the router falls through and treats
+ *  it as an ordinary message. `!restart` and `!reconnect` are synonyms. Pure. */
+export function parseRouterAdminCommand(cmd: string, arg: string): RouterAdminCommand | null {
+  switch (cmd) {
+    case 'status':
+      return { kind: 'status' }
+    case 'kill':
+      return { kind: 'kill', name: arg.split(/\s+/)[0] }
+    case 'restart':
+    case 'reconnect':
+      return { kind: 'restart', name: arg.split(/\s+/)[0] }
+    case 'new-channel-bot':
+    case 'newchannelbot': {
+      const parts = arg ? arg.split(/\s+/) : []
+      return {
+        kind: 'newChannelBot',
+        rawName: parts[0] ?? '',
+        cwdArg: parts.length > 1 ? parts.slice(1).join(' ') : undefined,
+      }
+    }
+    default:
+      return null
+  }
+}
+
+/** Router-side liveness view of a session, joined into `mergeStatus`. */
+export interface RouterSessionView {
+  name: string
+  pid: number
+  live: boolean
+  claims: string[]
+  isDefault: boolean
+}
+
+/** Supervisor-side process/config view of a session, joined into `mergeStatus`. */
+export interface SupervisorSessionView {
+  name: string
+  tmux: boolean
+  bind: string[]
+  cwd: string
+  uuid?: string
+}
+
+/** Render the enriched `!status` body by joining the router's registration
+ *  view with the supervisor's process/config view, keyed by session name. A
+ *  session present in one source but not the other is surfaced (e.g. an
+ *  orphaned tmux window with no registration, or a configured session that
+ *  never came up). Pure. */
+export function mergeStatus(
+  router: readonly RouterSessionView[],
+  supervisor: readonly SupervisorSessionView[],
+): string {
+  const names = new Set<string>([...router.map((r) => r.name), ...supervisor.map((s) => s.name)])
+  if (names.size === 0) return 'No sessions known to the router or supervisor.'
+  const rByName = new Map(router.map((r) => [r.name, r]))
+  const sByName = new Map(supervisor.map((s) => [s.name, s]))
+  const lines: string[] = []
+  for (const name of [...names].sort()) {
+    const r = rByName.get(name)
+    const s = sByName.get(name)
+    const dot = r?.live ? '●' : '○'
+    const def = r?.isDefault ? ' (default)' : ''
+    const reg = r?.live ? 'registered' : 'unregistered'
+    const tmux = s ? (s.tmux ? 'tmux up' : 'tmux down') : 'not in supervisor config'
+    const pid = r ? ` pid ${r.pid}` : ''
+    const bind = s?.bind.length ? ` bind: ${s.bind.join(', ')}` : ''
+    const cwd = s?.cwd ? ` cwd: ${escMrkdwn(s.cwd)}` : ''
+    lines.push(`${dot} ${escMrkdwn(name)}${def} — ${reg}, ${tmux}${pid}${bind}${cwd}`)
+  }
+  return lines.join('\n')
+}
+
+/** Slack `<#C…>` channel mention. Pure. */
+export function formatChannelLink(channelId: string): string {
+  return `<#${channelId}>`
+}
+
+export interface NewChannelBotReplyArgs {
+  channelId: string
+  sessionName: string
+  cwd: string
+  operatorUserId: string
+}
+
+/** The success reply for `!new-channel-bot`. Deliberately includes the exact
+ *  terminal opt-in command rather than silently writing `access.json` from a
+ *  Slack message: a freshly created channel is absent from `access.channels`,
+ *  so the inbound gate drops every message there until a human opts it in.
+ *  Surfacing that boundary (instead of bypassing it) keeps the "no access
+ *  grants from chat" invariant intact. Pure. */
+export function buildNewChannelBotReply(args: NewChannelBotReplyArgs): string {
+  const { channelId, sessionName, cwd, operatorUserId } = args
+  return [
+    `Created ${formatChannelLink(channelId)} and wired session \`${escMrkdwn(sessionName)}\` (cwd \`${escMrkdwn(cwd)}\`).`,
+    ":warning: I can't read messages there yet — opt the channel in from your terminal:",
+    `    /slack-channel:access channel ${channelId} --allow ${operatorUserId}`,
+    'Until then the channel is silent (the gate drops all messages — by design).',
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // Epic 30-B — audit receipt projection (pre-execution receipt blocks)
 // ---------------------------------------------------------------------------
 

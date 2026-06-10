@@ -33,11 +33,22 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, unlinkSync } from 'node:fs'
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  chmodSync,
+  mkdirSync,
+  openSync,
+  unlinkSync,
+} from 'node:fs'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { isValidSessionName, validateBotCwd } from './lib.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROUTER_DIR = join(homedir(), '.claude', 'slack-router')
@@ -69,6 +80,21 @@ interface SupervisorConfig {
    *  storm when several sessions need launching at once. */
   maxSpawnPerTick: number
   routerPort: number
+  /** Loopback port for the operator control API (router → supervisor) that
+   *  backs the Slack `!status` / `!kill` / `!restart` / `!new-channel-bot`
+   *  commands. Bound to 127.0.0.1 only. */
+  supervisorPort: number
+  /** Default working directory a `!new-channel-bot` session spawns in when the
+   *  operator doesn't pass an explicit path. Empty → `/sessions/add` with no
+   *  cwd is rejected (fail loud rather than guess a path). */
+  defaultCwd: string
+  /** Allow-set that confines the cwd a new channel-bot may spawn in (plus
+   *  `defaultCwd` and its subdirectories, which are always allowed). A path
+   *  from a Slack message that resolves outside these roots is rejected. */
+  allowedCwdRoots: string[]
+  /** Visibility of channels created by `!new-channel-bot`. Passed to the
+   *  router via env; default `private` (smaller exposure surface). */
+  newChannelVisibility: 'public' | 'private'
   router: { enabled: boolean }
   claudeBin: string
   /** Path to the minimal --mcp-config JSON defining only the slack-session
@@ -98,6 +124,10 @@ function defaultConfig(): SupervisorConfig {
     bootGraceMs: 90_000,
     maxSpawnPerTick: 2,
     routerPort: 8801,
+    supervisorPort: 8802,
+    defaultCwd: '',
+    allowedCwdRoots: [],
+    newChannelVisibility: 'private',
     router: { enabled: true },
     claudeBin: 'claude',
     mcpConfigPath: join(ROUTER_DIR, 'slack-session.mcp.json'),
@@ -107,13 +137,32 @@ function defaultConfig(): SupervisorConfig {
   }
 }
 
+/** Path of the config currently loaded — captured so the control API can
+ *  persist runtime mutations (`/sessions/add` and `/sessions/kill`) back to
+ *  the same file. */
+let activeCfgPath = ''
+
 function loadConfig(path: string): SupervisorConfig {
+  activeCfgPath = path
   if (!existsSync(path)) {
     log(`No config at ${path} — copy supervisor.example.json there and edit it.`)
     process.exit(1)
   }
   const raw = JSON.parse(readFileSync(path, 'utf-8')) as Partial<SupervisorConfig>
   return { ...defaultConfig(), ...raw, router: { ...defaultConfig().router, ...(raw.router ?? {}) } }
+}
+
+/** Persist the full in-memory config atomically (tmp + chmod 0o600 + rename).
+ *  NOTE: once the control API mutates sessions this rewrites the operator's
+ *  hand-edited supervisor.json — comments/formatting are lost and
+ *  defaultConfig() defaults are merged in. The file becomes partly
+ *  machine-managed from that point on. */
+function saveConfig(cfg: SupervisorConfig): void {
+  if (!activeCfgPath) return
+  const tmp = `${activeCfgPath}.tmp`
+  writeFileSync(tmp, JSON.stringify(cfg, null, 2))
+  chmodSync(tmp, 0o600)
+  renameSync(tmp, activeCfgPath)
 }
 
 // ── Persisted state (router pid, per-session uuid) ───────────────────────────
@@ -183,6 +232,21 @@ function tmuxSend(name: string, keys: string): void {
 }
 const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
+// ── Serialization lock ─────────────────────────────────────────────────────
+// tick() iterates cfg.sessions; the control API mutates it. Node is
+// single-threaded, but both yield at await points — a mutation landing
+// mid-iteration could skip or double-visit a session. Funnel tick() and every
+// mutating endpoint through one promise chain so they never interleave.
+let lock: Promise<unknown> = Promise.resolve()
+function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  const run = lock.then(() => fn())
+  lock = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
 /** `--dangerously-load-development-channels` shows a one-time interactive
  *  confirmation ("1. I am using this for local development / Enter to confirm").
  *  Option 1 is preselected, so a bare Enter accepts it. We poll the pane and
@@ -220,7 +284,14 @@ function ensureRouter(cfg: SupervisorConfig): void {
     cwd: HERE,
     detached: true,
     stdio: ['ignore', out, out],
-    env: { ...process.env, ROUTER_PORT: String(cfg.routerPort) },
+    env: {
+      ...process.env,
+      ROUTER_PORT: String(cfg.routerPort),
+      // Let the router reach the control API and know the channel-visibility
+      // policy — supervisor.json stays the single source of operator config.
+      SUPERVISOR_PORT: String(cfg.supervisorPort),
+      NEW_CHANNEL_VISIBILITY: cfg.newChannelVisibility,
+    },
   })
   child.unref()
   state.routerPid = child.pid ?? null
@@ -364,6 +435,146 @@ function down(cfg: SupervisorConfig): void {
   log('down: killed session tmux windows + router + swept orphans')
 }
 
+// ── Control API (Slack !commands → router → supervisor) ─────────────────────
+// Loopback-only HTTP. The router is the only caller; it translates operator
+// Slack verbs into these calls. Mutating endpoints run under withLock so they
+// never interleave with a tick().
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const c of req) chunks.push(c as Buffer)
+  return Buffer.concat(chunks).toString('utf8')
+}
+function sendJson(res: ServerResponse, code: number, obj: unknown): void {
+  res.writeHead(code, { 'content-type': 'application/json' })
+  res.end(JSON.stringify(obj))
+}
+
+function statusSnapshot(cfg: SupervisorConfig): Record<string, unknown> {
+  return {
+    ok: true,
+    routerPid: state.routerPid,
+    routerAlive: pidAlive(state.routerPid),
+    sessions: cfg.sessions.map(s => ({
+      name: s.name,
+      tmux: tmuxHas(`slack-${s.name}`),
+      bind: s.bind ?? [],
+      cwd: s.cwd,
+      uuid: state.sessions[s.name]?.sessionId,
+    })),
+  }
+}
+
+/** Side-effect-free validation of a prospective new session. The router calls
+ *  this BEFORE creating a Slack channel so a bad name/cwd fails loudly without
+ *  leaving an orphaned empty channel behind. Read-only — no lock needed. */
+function precheckSession(cfg: SupervisorConfig, body: Record<string, unknown>, res: ServerResponse): void {
+  const name = String(body.name ?? '')
+  const cwdArg = body.cwd === undefined ? undefined : String(body.cwd)
+  if (!isValidSessionName(name)) {
+    return sendJson(res, 400, { ok: false, error: `invalid session name: ${name}` })
+  }
+  if (cfg.sessions.some(s => s.name === name) || tmuxHas(`slack-${name}`)) {
+    return sendJson(res, 400, { ok: false, error: `session "${name}" already exists` })
+  }
+  const cwd = validateBotCwd(cwdArg, cfg.defaultCwd, cfg.allowedCwdRoots)
+  if (!cwd.ok) return sendJson(res, 400, { ok: false, error: cwd.error })
+  return sendJson(res, 200, { ok: true, name, cwd: cwd.cwd })
+}
+
+function addSession(cfg: SupervisorConfig, body: Record<string, unknown>, res: ServerResponse): void {
+  const name = String(body.name ?? '')
+  const bind = Array.isArray(body.bind) ? (body.bind as unknown[]).map(String) : []
+  const cwdArg = body.cwd === undefined ? undefined : String(body.cwd)
+  const resume = body.resume === undefined ? true : Boolean(body.resume)
+
+  if (!isValidSessionName(name)) {
+    return sendJson(res, 400, { ok: false, error: `invalid session name: ${name}` })
+  }
+  if (cfg.sessions.some(s => s.name === name) || tmuxHas(`slack-${name}`)) {
+    return sendJson(res, 400, { ok: false, error: `session "${name}" already exists` })
+  }
+  const cwd = validateBotCwd(cwdArg, cfg.defaultCwd, cfg.allowedCwdRoots)
+  if (!cwd.ok) {
+    return sendJson(res, 400, { ok: false, error: cwd.error })
+  }
+  const session: SessionConfig = { name, cwd: cwd.cwd, bind, resume }
+  cfg.sessions.push(session) // in place — the tick() closure shares this array
+  saveConfig(cfg)
+  ensureSession(cfg, session, new Set()) // spawn now, don't wait for the next tick
+  if (!tmuxHas(`slack-${name}`)) {
+    return sendJson(res, 500, {
+      ok: false,
+      error: `session "${name}" was added to config but its tmux window did not start (is tmux installed?)`,
+    })
+  }
+  return sendJson(res, 200, { ok: true, name, cwd: cwd.cwd })
+}
+
+function killSession(cfg: SupervisorConfig, body: Record<string, unknown>, res: ServerResponse): void {
+  const name = String(body.name ?? '')
+  const idx = cfg.sessions.findIndex(s => s.name === name)
+  if (idx < 0) return sendJson(res, 404, { ok: false, error: `unknown session: ${name}` })
+  cfg.sessions.splice(idx, 1) // removing from config is what stops the respawn loop
+  saveConfig(cfg)
+  tmuxKill(`slack-${name}`)
+  // Keep state.sessions[name] so the --resume UUID survives an accidental
+  // kill + re-add. Sweep the killed session's orphaned plugin MCP children.
+  reapOrphans()
+  return sendJson(res, 200, { ok: true, name })
+}
+
+function restartSession(cfg: SupervisorConfig, body: Record<string, unknown>, res: ServerResponse): void {
+  const name = String(body.name ?? '')
+  const s = cfg.sessions.find(x => x.name === name)
+  if (!s) return sendJson(res, 404, { ok: false, error: `unknown session: ${name}` })
+  tmuxKill(`slack-${name}`)
+  const st = state.sessions[name]
+  if (st) st.lastSpawnAt = 0 // skip the minRespawnMs floor so it comes back immediately
+  ensureSession(cfg, s, new Set()) // respawns with --resume (spawnedOnce already true)
+  return sendJson(res, 200, { ok: true, name })
+}
+
+function startControlServer(cfg: SupervisorConfig): void {
+  const server = createServer((req, res) => {
+    void (async () => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      if (req.method === 'GET' && url.pathname === '/status') {
+        return sendJson(res, 200, statusSnapshot(cfg))
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(404)
+        return res.end('not found')
+      }
+      let body: Record<string, unknown>
+      try {
+        body = JSON.parse((await readBody(req)) || '{}')
+      } catch {
+        return sendJson(res, 400, { ok: false, error: 'bad json' })
+      }
+      try {
+        switch (url.pathname) {
+          case '/sessions/precheck':
+            return precheckSession(cfg, body, res)
+          case '/sessions/add':
+            return await withLock(() => addSession(cfg, body, res))
+          case '/sessions/kill':
+            return await withLock(() => killSession(cfg, body, res))
+          case '/sessions/restart':
+            return await withLock(() => restartSession(cfg, body, res))
+          default:
+            res.writeHead(404)
+            return res.end('not found')
+        }
+      } catch (err) {
+        return sendJson(res, 500, { ok: false, error: String(err) })
+      }
+    })()
+  })
+  server.listen(cfg.supervisorPort, '127.0.0.1', () => {
+    log(`control API on http://127.0.0.1:${cfg.supervisorPort} (/status, /sessions/{add,kill,restart})`)
+  })
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
@@ -413,10 +624,11 @@ async function main(): Promise<void> {
   process.on('exit', clearPidfile)
 
   log(`supervising (router:${cfg.router.enabled} sessions:${cfg.sessions.length} interval:${cfg.checkIntervalMs}ms)`)
-  await tick(cfg)
+  startControlServer(cfg)
+  await withLock(() => tick(cfg))
   if (once) return
   const timer = setInterval(() => {
-    void tick(cfg).catch(err => log(`tick error: ${err}`))
+    void withLock(() => tick(cfg)).catch(err => log(`tick error: ${err}`))
   }, cfg.checkIntervalMs)
   // Keep the supervisor alive; leave children running on supervisor exit
   // (use `down` to tear them down explicitly).

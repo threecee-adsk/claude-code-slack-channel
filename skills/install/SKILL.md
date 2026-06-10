@@ -74,7 +74,7 @@ If any check fails, give the recovery command, wait for the user to fix, then re
 
 - **Faster path** — run `/slack-channel:install manifest` first to download
   a `slack-app-manifest.json`, then at https://api.slack.com/apps click
-  **Create New App → From an app manifest** and paste it. All 8 scopes
+  **Create New App → From an app manifest** and paste it. All 10 scopes
   and 4 event subscriptions are pre-configured. User just clicks
   **Install to Workspace** and copies the two tokens.
 - **Manual path** — walk the 5-step UI checklist. See
@@ -248,9 +248,12 @@ After repair, re-run `doctor` and show before/after.
 
 ## Mode: `manifest`
 
-Generate a Slack app manifest JSON that pre-configures all 8 OAuth scopes
+Generate a Slack app manifest JSON that pre-configures all 10 OAuth scopes
 and 4 event subscriptions in one import. Saves a fresh user ~10 minutes
 of UI clicking and eliminates the "did I add the right scopes" failure mode.
+(`channels:manage` + `groups:write` back the `!new-channel-bot` operator
+command — multi-session mode only; the bridge works fine without them, the
+command just returns a `missing_scope` hint.)
 
 Write `slack-app-manifest.json` to the user's current directory:
 
@@ -277,7 +280,9 @@ Write `slack-app-manifest.json` to the user's current directory:
         "reactions:write",
         "files:read",
         "files:write",
-        "users:read"
+        "users:read",
+        "channels:manage",
+        "groups:write"
       ]
     }
   },
